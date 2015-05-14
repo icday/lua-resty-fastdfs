@@ -10,6 +10,7 @@ local split_fileid = utils.split_fileid
 local tcp = ngx.socket.tcp
 local string = string
 local table  = table
+local pairs = pairs
 local setmetatable = setmetatable
 local error = error
 
@@ -20,18 +21,22 @@ local VERSION = '0.2.0'
 local FDFS_PROTO_PKG_LEN_SIZE = 8
 local FDFS_FILE_EXT_NAME_MAX_LEN = 6
 local FDFS_FILE_PREFIX_MAX_LEN = 16
+local FDFS_GROUP_NAME_MAX_LEN = 16
 local FDFS_PROTO_CMD_QUIT = 82
 local STORAGE_PROTO_CMD_UPLOAD_FILE = 11
 local STORAGE_PROTO_CMD_DELETE_FILE = 12
--- local STORAGE_PROTO_CMD_SET_METADATA = 13
+local STORAGE_PROTO_CMD_SET_METADATA = 13
 local STORAGE_PROTO_CMD_DOWNLOAD_FILE = 14
--- local STORAGE_PROTO_CMD_GET_METADATA = 15
+local STORAGE_PROTO_CMD_GET_METADATA = 15
 local STORAGE_PROTO_CMD_UPLOAD_SLAVE_FILE = 21
 local STORAGE_PROTO_CMD_QUERY_FILE_INFO = 22
 local STORAGE_PROTO_CMD_UPLOAD_APPENDER_FILE = 23
 local STORAGE_PROTO_CMD_APPEND_FILE = 24
 local STORAGE_PROTO_CMD_MODIFY_FILE = 34
 local STORAGE_PROTO_CMD_TRUNCATE_FILE = 36
+
+local FDFS_RECORD_SEPERATOR = '\x01'
+local FDFS_FIELD_SEPERATOR = '\x02'
 
 local mt = { __index = _M }
 
@@ -173,6 +178,41 @@ function read_download_result_cb(self, cb)
         cb(data)
     end
     return true
+end
+
+local function string_split(str, split_char)
+    local res = {}
+    local i = 0
+    local j = 0
+    while true do
+        j = str:find(split_char, i + 1)
+        if j == nil then
+            table.insert(res, str:sub(i + 1))
+            break
+        end
+        table.insert(res, str:sub(i + 1, j - 1))
+        i = j
+    end
+    return res
+end
+
+local function unpack_metadata(string)
+    if not string or string:len() < 3 then
+        return nil
+    end
+    local res = {}
+    local fields = string_split(string, FDFS_RECORD_SEPERATOR)
+    if not fields then
+        return res
+    end
+    local i, len = 1, #fields
+    for i = 1, len, 1 do
+        local fv = string_split(fields[i], FDFS_FIELD_SEPERATOR)
+        if fv and #fv == 2 then
+            res[fv[1]] = fv[2]
+        end
+    end
+    return res
 end
 
 -- build upload method
@@ -411,6 +451,90 @@ function download_file_to_buff1(self, fileid)
         return nil, "fileid error:" .. err
     end
     return self:download_file_to_buff(group_name, file_name)
+end
+
+
+function get_file_metadata(self, group_name, file_name)
+  if not file_name then
+    return nil
+  end
+
+  local content = self:download_file_to_buff(group_name, file_name .. '-m')
+
+  if not content then
+    return nil
+  end
+  return unpack_metadata(content)
+end
+
+function get_file_metadata1(self, fileid)
+    local group_name, file_name, err = split_fileid(fileid)
+    if not group_name or not file_name then
+        return nil, "fileid error:" .. err
+    end
+    return self:get_file_metadata(group_name, file_name)
+end
+
+local function pack_metadata(metadata)
+    if not metadata then
+        return 'invalid metadata'
+    end
+
+    local s, k, v
+    local fields = {}
+    for k, v in pairs(metadata) do
+        if k and v then
+            table.insert(fields, k .. FDFS_FIELD_SEPERATOR .. v)
+        end
+    end
+    return nil, table.concat(fields, FDFS_RECORD_SEPERATOR)
+end
+
+function set_file_metadata1(self, fileid, metadata)
+    local group_name, filename, err = split_fileid(fileid)
+
+    if err then
+        return nil, err
+    end
+
+    return self:set_file_metadata(group_name, filename, metadata)
+end
+
+function set_file_metadata(self, group, filename, metadata)
+    if not group or not filename or not metadata then
+        return nil, 'invalid fileid or metadata'
+    end
+
+    local err, meta_buff = pack_metadata(metadata)
+
+    if err or not meta_buff then
+        return nil, err or 'invalid metadata'
+    end
+
+    local meta_bytes = string.len(meta_buff)
+    local filename_len = string.len(filename)
+
+    local out = {}
+
+    table.insert(out, int2buf(meta_bytes + filename_len + FDFS_PROTO_PKG_LEN_SIZE * 2 + 1 + FDFS_GROUP_NAME_MAX_LEN))
+    table.insert(out, string.char(STORAGE_PROTO_CMD_SET_METADATA))
+    table.insert(out, '\00')
+
+    table.insert(out, int2buf(filename_len))
+    table.insert(out, int2buf(meta_bytes))
+
+    table.insert(out, 'O')
+
+    table.insert(out, fix_string(group, FDFS_GROUP_NAME_MAX_LEN))
+    table.insert(out, filename)
+    table.insert(out, meta_buff)
+
+    local ok, err = self:send_request(out, sock, size)
+    if not ok then
+        return nil, err
+    end
+
+    return self:read_update_result("set_file_metadata")
 end
 
 function download_file_to_callback(self,group_name, file_name, cb)
